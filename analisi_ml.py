@@ -1,73 +1,76 @@
 import streamlit as st
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.linear_model import LogisticRegression
+import numpy as np
 from sklearn.ensemble import RandomForestClassifier
-from xgboost import XGBClassifier
-from sklearn.metrics import roc_auc_score, accuracy_score, roc_curve
+from sklearn.metrics import classification_report, ConfusionMatrixDisplay
+import matplotlib.pyplot as plt
 
-st.title("📊 Analisi Risposte dei Compilatori Virtuali")
+st.title("🧠 Analisi Combinazioni Risposte Target/Controllo")
 
-uploaded_file = st.file_uploader("Carica il file CSV simulato", type=["csv"])
+uploaded_file = st.file_uploader("Carica il file CSV generato", type=["csv"])
 
 if uploaded_file:
     df = pd.read_csv(uploaded_file)
 
-    st.success("File caricato correttamente.")
-    st.write("Esempio di dati:", df.head(3))
+    st.success("CSV caricato!")
 
-    # Filtra e calcola accuratezza
+    # Separazione dati
     test_df = df[df["type"] == "test"].copy()
-    test_df["correct"] = test_df["response"] == test_df["corretta"]
+    target_df = df[df["type"] == "target"][["participant_id", "response"]].rename(columns={"response": "resp_target"})
+    control_df = df[df["type"] == "control"][["participant_id", "response"]].rename(columns={"response": "resp_control"})
 
-    acc_df = test_df.groupby("participant_id")["correct"].mean().reset_index()
-    acc_df = acc_df.rename(columns={"correct": "accuracy_test"})
+    # Merge risposte target e controllo
+    combos = target_df.merge(control_df, on="participant_id")
+    
+    # Crea etichetta combinata
+    def combo_label(row):
+        if row["resp_target"] == True and row["resp_control"] == False:
+            return "Target TRUE / Control FALSE"
+        elif row["resp_target"] == False and row["resp_control"] == True:
+            return "Target FALSE / Control TRUE"
+        elif row["resp_target"] == True and row["resp_control"] == True:
+            return "Entrambe TRUE"
+        else:
+            return "Entrambe FALSE"
 
-    # Estrai risposte target e controllo
-    target_df = df[df["type"] == "target"][["participant_id", "response"]].rename(columns={"response": "target_response"})
-    control_df = df[df["type"] == "control"][["participant_id", "response"]].rename(columns={"response": "control_response"})
+    combos["target_combo"] = combos.apply(combo_label, axis=1)
 
-    # Merge
-    full_df = acc_df.merge(target_df, on="participant_id").merge(control_df, on="participant_id")
+    # Costruzione features: risposte ai test (30)
+    feature_rows = []
+    for pid, group in test_df.groupby("participant_id"):
+        ordered = group.sort_values("frase")  # Ordine garantito
+        feature_rows.append({
+            "participant_id": pid,
+            **{f"q{i+1}": bool(r) for i, r in enumerate(ordered["response"].tolist())}
+        })
 
-    st.subheader("Distribuzione dell'accuratezza nei test")
+    features_df = pd.DataFrame(feature_rows)
+
+    # Merge con target_combo
+    dataset = features_df.merge(combos[["participant_id", "target_combo"]], on="participant_id")
+
+    st.write("Anteprima dataset pronto per l'analisi:")
+    st.dataframe(dataset.head())
+
+    # Addestramento modello
+    X = dataset[[f"q{i+1}" for i in range(30)]]
+    y = dataset["target_combo"]
+
+    model = RandomForestClassifier(n_estimators=100, random_state=42)
+    model.fit(X, y)
+    y_pred = model.predict(X)
+
+    st.subheader("📊 Report del modello")
+    st.text(classification_report(y, y_pred))
+
+    # Confusion matrix
     fig, ax = plt.subplots()
-    sns.histplot(full_df["accuracy_test"], bins=10, kde=True, ax=ax)
+    disp = ConfusionMatrixDisplay.from_estimator(model, X, y, ax=ax, cmap="Blues", xticks_rotation=45)
     st.pyplot(fig)
 
-    st.subheader("Scegli la frase da analizzare")
-    scelta = st.radio("Quale risposta vuoi prevedere?", ("Target", "Controllo"))
+    # Analisi delle classi più comuni
+    st.subheader("🔍 Distribuzione delle classi (combinazioni target/control)")
+    st.bar_chart(dataset["target_combo"].value_counts())
 
-    y_col = "target_response" if scelta == "Target" else "control_response"
-    y = full_df[y_col].astype(int)
-    X = full_df[["accuracy_test"]]
-
-    models = {
-        "Logistic Regression": LogisticRegression(),
-        "Random Forest": RandomForestClassifier(n_estimators=100, random_state=0),
-        "XGBoost": XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=0)
-    }
-
-    st.subheader("Risultati dei Modelli")
-
-    for name, model in models.items():
-        model.fit(X, y)
-        y_prob = model.predict_proba(X)[:, 1]
-        y_pred = model.predict(X)
-
-        auc = roc_auc_score(y, y_prob)
-        acc = accuracy_score(y, y_pred)
-
-        st.markdown(f"**{name}**")
-        st.write(f"AUC: {auc:.2f}, Accuracy: {acc:.2f}")
-
-        fpr, tpr, _ = roc_curve(y, y_prob)
-        fig, ax = plt.subplots()
-        ax.plot(fpr, tpr, label=f"AUC = {auc:.2f}")
-        ax.plot([0, 1], [0, 1], linestyle="--", color="gray")
-        ax.set_xlabel("False Positive Rate")
-        ax.set_ylabel("True Positive Rate")
-        ax.set_title(f"ROC Curve - {name}")
-        ax.legend()
-        st.pyplot(fig)
+    st.info("Interpretazione: se la maggioranza dei compilatori con pattern coerente cade in una specifica combinazione, "
+            "questa combinazione potrebbe essere più plausibile.")
